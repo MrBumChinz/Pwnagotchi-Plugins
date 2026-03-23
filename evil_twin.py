@@ -31,6 +31,7 @@
 import logging
 import os
 import json
+import re
 import subprocess
 import tempfile
 import threading
@@ -174,6 +175,25 @@ def _already_cracked(pcap_path):
         os.path.exists(pcap_path + ".cracked")
         or os.path.exists(pcap_path + ".key")
     )
+
+
+def _ssid_from_filename(path):
+    """Extract the SSID from a pwnagotchi handshake filename.
+
+    Pwnagotchi names files: {ssid}_{bssid}.pcap
+    The BSSID is a MAC address, e.g. aa:bb:cc:dd:ee:ff (or with underscores).
+    Strip it to recover the SSID.
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    # Match trailing _XX[_:]XX[_:]XX[_:]XX[_:]XX[_:]XX (MAC address)
+    m = re.search(
+        r'_[0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}'
+        r'[_:][0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}$',
+        name
+    )
+    if m:
+        return name[:m.start()]
+    return name
 
 
 # ─── Session (one evil twin run) ─────────────────────────────────────────────
@@ -362,11 +382,41 @@ class EvilTwin(plugins.Plugin):
                                          name="evil_twin_worker")
         self._worker.start()
         logging.info("[evil_twin] loaded — AP:%s  mon:%s", iface_ap, iface_mon)
+        # Queue any stored handshakes that were never cracked. Pwnagotchi
+        # skips APs it already has a .pcap for, so on_handshake never fires
+        # for them again — we pick them up here instead.
+        self._queue_existing_uncracked()
 
     def on_unload(self, ui):
         self._running = False
         if self._session:
             self._session.cleanup()
+
+    def _queue_existing_uncracked(self):
+        """Scan the handshakes dir for .pcap files with no .cracked/.key file
+        and add them to the queue. Handles the edge case where pwnagotchi
+        already has a handshake for a network so on_handshake never fires."""
+        hs_dir = self.options.get("handshake_dir", "/root/handshakes/")
+        try:
+            pcaps = [
+                os.path.join(hs_dir, f)
+                for f in os.listdir(hs_dir)
+                if f.endswith(".pcap")
+            ]
+        except Exception:
+            return
+        queued = 0
+        for pcap in sorted(pcaps):
+            if _already_cracked(pcap):
+                continue
+            ssid = _ssid_from_filename(pcap)
+            try:
+                self._q.put_nowait((ssid, pcap))
+                queued += 1
+            except queue.Full:
+                break
+        if queued:
+            logging.info("[evil_twin] queued %d existing uncracked handshake(s)", queued)
 
     def on_handshake(self, agent, filename, access_point, client_station):
         if not self._running:

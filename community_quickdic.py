@@ -43,6 +43,7 @@
 import logging
 import os
 import json
+import re
 import subprocess
 import threading
 import time
@@ -67,6 +68,23 @@ USER_AGENT = "pwnagotchi-community_quickdic/" + PLUGIN_VERSION
 MIN_PASSWORD_LEN = 8
 MAX_PASSWORD_LEN = 128
 COMMUNITY_WORDLIST_NAME = "community_passwords.txt"
+
+
+def _ssid_from_pcap_filename(path):
+    """Extract SSID from a pwnagotchi handshake filename.
+
+    Pwnagotchi names files: {ssid}_{bssid}.pcap
+    The BSSID is a MAC address (aa:bb:cc:dd:ee:ff or with underscores).
+    """
+    name = os.path.splitext(os.path.basename(path))[0]
+    m = re.search(
+        r'_[0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}'
+        r'[_:][0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}[_:][0-9a-fA-F]{2}$',
+        name
+    )
+    if m:
+        return name[:m.start()]
+    return name
 
 
 class Community_Quickdic(plugins.Plugin):
@@ -99,6 +117,7 @@ class Community_Quickdic(plugins.Plugin):
         self._isp_defaults = self.options.get("isp_defaults", [])
         self._telegram_token = self.options.get("telegram_token", "").strip()
         self._telegram_chat_id = self.options.get("telegram_chat_id", "").strip()
+        self._handshake_dir = self.options.get("handshake_dir", "/root/handshakes/")
         self._community_wordlist = os.path.join(
             self._wordlist_folder, COMMUNITY_WORDLIST_NAME
         )
@@ -137,8 +156,38 @@ class Community_Quickdic(plugins.Plugin):
             )
 
         self._start_sync()
+        # Queue any stored handshakes that were never cracked. Pwnagotchi
+        # skips APs it already has a .pcap for, so on_handshake never fires
+        # for them again — we pick them up here so they're cracked on next sleep.
+        self._queue_existing_uncracked()
 
-    def on_internet_available(self, agent):
+    def _queue_existing_uncracked(self):
+        """Scan handshake_dir for .pcap files with no .cracked/.key file."""
+        try:
+            pcaps = [
+                os.path.join(self._handshake_dir, f)
+                for f in os.listdir(self._handshake_dir)
+                if f.endswith(".pcap")
+            ]
+        except Exception:
+            return
+        added = 0
+        with self._pending_lock:
+            already_queued = {f for f, _ in self._pending}
+            for pcap in sorted(pcaps):
+                if pcap in self._cracked:
+                    continue
+                if os.path.exists(pcap + ".cracked") or os.path.exists(pcap + ".key"):
+                    continue
+                if pcap not in already_queued:
+                    ssid = _ssid_from_pcap_filename(pcap)
+                    self._pending.append((pcap, ssid))
+                    added += 1
+        if added:
+            logging.info(
+                "[community_quickdic] queued %d existing uncracked handshake(s) — "
+                "will crack when idle" % added
+            )
         now = time.time()
         if now - self._last_sync >= 300:
             self._start_sync()
