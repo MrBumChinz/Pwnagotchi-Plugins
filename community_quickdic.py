@@ -298,6 +298,11 @@ class Community_Quickdic(plugins.Plugin):
                     display.update(force=True)
 
                     self._send_telegram(filename, ssid, password)
+                    # Submit to community pool so others benefit too
+                    if self._submit_password(password):
+                        logging.info(
+                            "[community_quickdic] submitted cracked password to community pool"
+                        )
                     return  # stop trying wordlists once cracked
 
             except subprocess.TimeoutExpired:
