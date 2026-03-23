@@ -19,7 +19,7 @@
 #   [main.plugins.evil_twin]
 #   enabled          = true
 #   iface_ap         = "wlan0"
-#   iface_mon        = "wlan1mon"
+#   iface_mon        = "wlan0mon"
 #   ap_ip            = "10.0.99.1"
 #   portal_port      = 8080
 #   deauth_rounds    = 3
@@ -406,7 +406,7 @@ class EvilTwin(plugins.Plugin):
 
     def on_loaded(self):
         iface_ap  = self.options.get("iface_ap",  "wlan0")
-        iface_mon = self.options.get("iface_mon", "wlan1mon")
+        iface_mon = self.options.get("iface_mon", "wlan0mon")
         if not _iface_exists(iface_ap) or not _iface_exists(iface_mon):
             logging.warning(
                 "[evil_twin] disabled — required interfaces not present "
@@ -461,7 +461,7 @@ class EvilTwin(plugins.Plugin):
         if not self._running:
             return
         iface_ap  = self.options.get("iface_ap",  "wlan0")
-        iface_mon = self.options.get("iface_mon", "wlan1mon")
+        iface_mon = self.options.get("iface_mon", "wlan0mon")
         if not _iface_exists(iface_ap) or not _iface_exists(iface_mon):
             logging.warning(
                 "[evil_twin] skipping handshake — %s or %s not present",
