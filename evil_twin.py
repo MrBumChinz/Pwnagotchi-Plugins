@@ -24,6 +24,7 @@
 #   portal_port      = 8080
 #   deauth_rounds    = 3
 #   deauth_interval  = 15
+#   session_timeout  = 300   # seconds before giving up if no client connects (0 = no timeout)
 #   submit           = true
 #   wordlist_folder  = "/home/pi/wordlists/"
 #   max_queue        = 10
@@ -201,7 +202,7 @@ def _ssid_from_filename(path):
 class _Session:
     def __init__(self, ssid, pcap, channel, iface_ap, iface_mon,
                  ap_ip, portal_port, deauth_rounds, deauth_interval,
-                 on_captured):
+                 on_captured, session_timeout=300):
         self.ssid            = ssid
         self.pcap            = pcap
         self.channel         = channel
@@ -212,6 +213,7 @@ class _Session:
         self.deauth_rounds   = deauth_rounds
         self.deauth_interval = deauth_interval
         self.on_captured     = on_captured
+        self.session_timeout = session_timeout  # seconds; 0 = no timeout
         self._procs          = []
         self._tmpfiles       = []
         self._stop           = threading.Event()
@@ -314,7 +316,14 @@ class _Session:
             daemon=True
         ).start()
         logging.info("[evil_twin] Portal on %s:%d", self.ap_ip, self.portal_port)
-        stop.wait()
+        timeout = self.session_timeout if self.session_timeout > 0 else None
+        captured = stop.wait(timeout=timeout)
+        if not captured:
+            logging.info(
+                "[evil_twin] Session timeout after %ds for '%s' — no client connected",
+                self.session_timeout, ssid
+            )
+            stop.set()
 
     def run(self):
         try:
@@ -464,6 +473,7 @@ class EvilTwin(plugins.Plugin):
                 deauth_rounds=int(self.options.get("deauth_rounds", 3)),
                 deauth_interval=int(self.options.get("deauth_interval", 15)),
                 on_captured=lambda s, pw: self._captured(s, pw, pcap),
+                session_timeout=int(self.options.get("session_timeout", 300)),
             )
             try:
                 self._session.run()
