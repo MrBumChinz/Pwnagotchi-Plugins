@@ -34,7 +34,9 @@ import logging
 import os
 import json
 import re
+import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -111,6 +113,54 @@ address=/#/{ap_ip}
 
 def _run(cmd):
     subprocess.run(cmd, shell=True, capture_output=True)
+
+
+def _ensure_deps():
+    """Install hostapd, dnsmasq, and flask if missing. Runs once on load.
+    Returns True if all deps are present after the check."""
+    apt_pkgs  = []
+    pip_pkgs  = []
+
+    if not shutil.which("hostapd"):
+        apt_pkgs.append("hostapd")
+    if not shutil.which("dnsmasq"):
+        apt_pkgs.append("dnsmasq")
+
+    try:
+        import flask  # noqa: F401
+    except ImportError:
+        pip_pkgs.append("flask")
+
+    if apt_pkgs:
+        logging.info("[evil_twin] installing missing packages: %s", apt_pkgs)
+        r = subprocess.run(
+            ["apt-get", "install", "-y", "--no-install-recommends"] + apt_pkgs,
+            capture_output=True,
+            env={**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+        )
+        if r.returncode != 0:
+            logging.error(
+                "[evil_twin] apt-get failed — please run: "
+                "sudo apt-get install -y %s", " ".join(apt_pkgs)
+            )
+            return False
+        logging.info("[evil_twin] apt packages installed: %s", apt_pkgs)
+
+    if pip_pkgs:
+        logging.info("[evil_twin] installing missing pip packages: %s", pip_pkgs)
+        r = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--quiet"] + pip_pkgs,
+            capture_output=True
+        )
+        if r.returncode != 0:
+            logging.error(
+                "[evil_twin] pip install failed — please run: "
+                "pip3 install %s", " ".join(pip_pkgs)
+            )
+            return False
+        logging.info("[evil_twin] pip packages installed: %s", pip_pkgs)
+
+    return True
 
 
 def _verify_password(pcap_path, ssid, password):
@@ -413,6 +463,10 @@ class EvilTwin(plugins.Plugin):
                 "(need %s and %s). Plugin will do nothing until both are up.",
                 iface_ap, iface_mon
             )
+            self._running = False
+            return
+        if not _ensure_deps():
+            logging.error("[evil_twin] disabled — missing dependencies (see above)")
             self._running = False
             return
         self._q       = queue.Queue(maxsize=self.options.get("max_queue", 10))
