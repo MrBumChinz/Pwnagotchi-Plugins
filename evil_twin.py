@@ -435,7 +435,7 @@ class EvilTwin(plugins.Plugin):
         """Scan the handshakes dir for .pcap files with no .cracked/.key file
         and add them to the queue. Handles the edge case where pwnagotchi
         already has a handshake for a network so on_handshake never fires."""
-        hs_dir = self.options.get("handshake_dir", "/root/handshakes/")
+        hs_dir = self.options.get("handshake_dir", "/home/pi/handshakes/")
         try:
             pcaps = [
                 os.path.join(hs_dir, f)

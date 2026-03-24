@@ -117,7 +117,7 @@ class Community_Quickdic(plugins.Plugin):
         self._isp_defaults = self.options.get("isp_defaults", [])
         self._telegram_token = self.options.get("telegram_token", "").strip()
         self._telegram_chat_id = self.options.get("telegram_chat_id", "").strip()
-        self._handshake_dir = self.options.get("handshake_dir", "/root/handshakes/")
+        self._handshake_dir = self.options.get("handshake_dir", "/home/pi/handshakes/")
         self._community_wordlist = os.path.join(
             self._wordlist_folder, COMMUNITY_WORDLIST_NAME
         )
